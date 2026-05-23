@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, useParams } from 'react-router-dom';
 import DisplayManager from './components/DisplayManager';
 import SetupPage from './components/SetupPage';
@@ -8,6 +8,99 @@ import './App.css';
 
 const DEMO_INITIAL = 12847;
 const DEMO_GROWTH_INITIAL = 42;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Daily growth helpers
+//
+// "Today's growth" = net change in follower count since midnight on the
+// device's local date. Persisted in localStorage so a page refresh doesn't
+// reset it. Resets automatically when the device date changes.
+//
+// Storage key format:  ig_growth_<username>
+// Value format:        { date: "2026-05-23", baseline: 101025769, growth: 42 }
+//
+// Rules:
+//   • On first load of the day  → baseline = current count, growth = 0
+//   • count > baseline          → growth += (count - baseline); baseline = count
+//   • count < baseline          → follower loss; growth stays (don't subtract),
+//                                  baseline = count  (so next gain is measured
+//                                  from the new lower value)
+//   • New calendar day          → reset: baseline = count, growth = 0
+// ─────────────────────────────────────────────────────────────────────────────
+
+function todayDateString() {
+  // Uses the device's local timezone (e.g. Asia/Calcutta)
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function growthKey(username) {
+  return `ig_growth_${username.toLowerCase().replace(/[^a-z0-9._]/g, '_')}`;
+}
+
+/**
+ * Load persisted growth state for a username.
+ * Returns { date, baseline, growth } or null if nothing stored.
+ */
+function loadGrowthState(username) {
+  try {
+    const raw = localStorage.getItem(growthKey(username));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.date && parsed.baseline != null && parsed.growth != null) {
+      return parsed;
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Persist growth state.
+ */
+function saveGrowthState(username, state) {
+  try {
+    localStorage.setItem(growthKey(username), JSON.stringify(state));
+  } catch (_) {}
+}
+
+/**
+ * Given the current follower count and the persisted state, return the
+ * updated { growth, baseline, date } and whether the state changed.
+ *
+ * @param {number} currentCount  - fresh follower count from API
+ * @param {string} username
+ * @returns {{ growth: number, baseline: number, date: string }}
+ */
+function computeGrowth(currentCount, username) {
+  const today = todayDateString();
+  const stored = loadGrowthState(username);
+
+  // No stored state, or new day → reset
+  if (!stored || stored.date !== today) {
+    const newState = { date: today, baseline: currentCount, growth: 0 };
+    saveGrowthState(username, newState);
+    return newState;
+  }
+
+  let { baseline, growth } = stored;
+
+  if (currentCount > baseline) {
+    // Gained followers
+    growth += currentCount - baseline;
+    baseline = currentCount;
+  } else if (currentCount < baseline) {
+    // Lost followers — don't subtract from growth (growth = net gains only)
+    // but update baseline so future gains are measured from here
+    baseline = currentCount;
+  }
+  // currentCount === baseline → no change
+
+  const newState = { date: today, baseline, growth };
+  saveGrowthState(username, newState);
+  return newState;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchYouTubeSubscribers(handle, apiKey) {
   const cleanHandle = handle.replace(/^@/, '');
@@ -30,7 +123,7 @@ function requestKioskFullscreen() {
   return p ? p.catch(() => {}) : Promise.resolve();
 }
 
-/* ── Kiosk splash — simple tap-to-continue, NO fullscreen API ─────────── */
+/* ── Kiosk splash ─────────────────────────────────────────────────────────── */
 const SPLASH_PLATFORMS = [
   {
     label: 'YouTube',
@@ -42,7 +135,7 @@ const SPLASH_PLATFORMS = [
       </svg>
     ),
   },
-    {
+  {
     label: 'Instagram',
     gradient: 'linear-gradient(135deg, #833AB4, #E1306C, #F77737)',
     glow: 'rgba(225,48,108,0.55)',
@@ -130,6 +223,10 @@ function KioskSplash({ visible, onStart }) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// App — demo / YouTube / non-Instagram live mode
+// ─────────────────────────────────────────────────────────────────────────────
+
 function App() {
   const [kioskReady, setKioskReady] = useState(false);
   const [initialPlatformIndex, setInitialPlatformIndex] = useState(0);
@@ -137,62 +234,36 @@ function App() {
   const [followers, setFollowers] = useState(DEMO_INITIAL);
   const [todayGrowth, setTodayGrowth] = useState(DEMO_GROWTH_INITIAL);
 
-  // Lock scroll position and re-enter fullscreen only when keyboard fully closes.
+  // Lock scroll + re-enter fullscreen when keyboard closes
   useEffect(() => {
     if (!kioskReady) return;
-
     const vv = window.visualViewport;
     let fullHeight = window.innerHeight;
     let keyboardOpen = false;
     let reenterTimer = null;
-
-    const lock = () => {
-      window.scrollTo(0, 0);
-      document.body.scrollTop = 0;
-      document.documentElement.scrollTop = 0;
-    };
-
+    const lock = () => { window.scrollTo(0, 0); document.body.scrollTop = 0; document.documentElement.scrollTop = 0; };
     const onResize = () => {
       lock();
       if (!vv) return;
       const currentHeight = vv.height;
       const wasOpen = keyboardOpen;
       keyboardOpen = currentHeight < fullHeight - 150;
-
-      if (!keyboardOpen) {
-        fullHeight = Math.max(fullHeight, currentHeight);
-      }
-
-      // Only re-request fullscreen when keyboard transitions from open → closed
+      if (!keyboardOpen) fullHeight = Math.max(fullHeight, currentHeight);
       if (wasOpen && !keyboardOpen) {
         clearTimeout(reenterTimer);
         reenterTimer = setTimeout(() => {
-          if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-            requestKioskFullscreen();
-          }
+          if (!document.fullscreenElement && !document.webkitFullscreenElement) requestKioskFullscreen();
         }, 400);
       }
     };
-
     lock();
-    if (vv) {
-      vv.addEventListener('resize', onResize);
-      vv.addEventListener('scroll', lock);
-    }
-
-    return () => {
-      clearTimeout(reenterTimer);
-      if (vv) {
-        vv.removeEventListener('resize', onResize);
-        vv.removeEventListener('scroll', lock);
-      }
-    };
+    if (vv) { vv.addEventListener('resize', onResize); vv.addEventListener('scroll', lock); }
+    return () => { clearTimeout(reenterTimer); if (vv) { vv.removeEventListener('resize', onResize); vv.removeEventListener('scroll', lock); } };
   }, [kioskReady]);
 
   const handleStart = useCallback((platformIndex = 0) => {
     setInitialPlatformIndex(platformIndex);
     requestKioskFullscreen();
-    // Small delay so fullscreen commits before splash fades
     setTimeout(() => setKioskReady(true), 200);
   }, []);
 
@@ -205,46 +276,31 @@ function App() {
       setFollowers(DEMO_INITIAL);
       setTodayGrowth(DEMO_GROWTH_INITIAL);
     }
-    // Re-enter fullscreen on display page (in case keyboard exited it on login)
     requestKioskFullscreen();
   }, []);
 
-  // Live refresh (YouTube / Instagram) or demo tick
+  // Live refresh (YouTube) or demo tick
   useEffect(() => {
     if (!session) return;
 
     if (session.isLive) {
-      // Pick the right interval from config
-      const interval = session.platform === 'instagram'
-        ? config.INSTAGRAM_POLL_INTERVAL_MS
-        : config.YOUTUBE_POLL_INTERVAL_MS;
-
-      // Periodically re-fetch the real count
+      const interval = config.YOUTUBE_POLL_INTERVAL_MS;
       const id = setInterval(async () => {
         try {
-          let fresh;
-          if (session.platform === 'instagram') {
-            const result = await fetchInstagramFollowers(session.handle);
-            if (result.status === 'found' || result.status === 'success') {
-              fresh = result.followerCount;
-            }
-          } else {
-            fresh = await fetchYouTubeSubscribers(session.handle, session.apiKey);
-          }
+          const fresh = await fetchYouTubeSubscribers(session.handle, session.apiKey);
           if (fresh != null) {
             setFollowers(prev => {
               const diff = fresh - prev;
               if (diff > 0) setTodayGrowth(g => g + diff);
+              // Note: decrement does NOT reduce todayGrowth
               return fresh;
             });
           }
-        } catch (_) {
-          // Silently ignore transient errors; keep current count
-        }
+        } catch (_) {}
       }, interval);
       return () => clearInterval(id);
     } else {
-      // Demo mode: simulate small ticks
+      // Demo mode
       const id = setInterval(() => {
         const inc = Math.floor(Math.random() * 3) + 1;
         setFollowers(p => p + inc);
@@ -270,17 +326,42 @@ function App() {
   );
 }
 
-// ── Instagram display page — loaded directly via /instagram/:username ─────
+// ─────────────────────────────────────────────────────────────────────────────
+// InstagramPage — /instagram/:username
+//
+// Growth logic:
+//   • todayGrowth = net follower gains since midnight (device local time)
+//   • Persisted in localStorage — survives page refresh
+//   • Resets automatically at midnight (new calendar date)
+//   • Decrements in follower count do NOT reduce todayGrowth
+//   • If the API returns an abbreviated/rounded count (same as last precise),
+//     the display stays at the last precise value (handled by proxy)
+// ─────────────────────────────────────────────────────────────────────────────
+
 function InstagramPage() {
   const { username } = useParams();
   const navigate = useNavigate();
+
   const [followers, setFollowers] = useState(null);
   const [todayGrowth, setTodayGrowth] = useState(0);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [kioskReady, setKioskReady] = useState(false);
 
-  // Kick off initial fetch then poll
+  // Track the last date we saw — used to detect midnight rollover
+  const lastDateRef = useRef(todayDateString());
+
+  // On mount: restore persisted growth state for today
+  useEffect(() => {
+    if (!username) return;
+    const stored = loadGrowthState(username);
+    const today  = todayDateString();
+    if (stored && stored.date === today) {
+      setTodayGrowth(stored.growth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [username]);
+
   useEffect(() => {
     if (!username) return;
 
@@ -290,17 +371,34 @@ function InstagramPage() {
       try {
         const result = await fetchInstagramFollowers(username);
         if (!isMounted) return;
+
         if (result.status === 'found' || result.status === 'success') {
-          setFollowers(prev => {
-            const next = result.followerCount;
-            if (prev != null && next > prev) setTodayGrowth(g => g + (next - prev));
-            return next;
-          });
+          const freshCount = result.followerCount;
+
+          // ── Midnight rollover check ──────────────────────────────────────
+          const today = todayDateString();
+          if (today !== lastDateRef.current) {
+            // New day — reset growth baseline
+            lastDateRef.current = today;
+            const newState = { date: today, baseline: freshCount, growth: 0 };
+            saveGrowthState(username, newState);
+            setFollowers(freshCount);
+            setTodayGrowth(0);
+            setError('');
+            return;
+          }
+
+          // ── Normal update ────────────────────────────────────────────────
+          const { growth } = computeGrowth(freshCount, username);
+          setFollowers(freshCount);
+          setTodayGrowth(growth);
           setError('');
+
         } else if (result.status === 'not_found') {
           setError(`@${username} not found.`);
         } else {
-          // Keep last known count; show soft error only on first load
+          // Unavailable / rate-limited — keep last known count, no error shown
+          // if we already have a value
           if (followers == null) setError(result.message || 'Could not load follower count.');
         }
       } catch (e) {
@@ -313,15 +411,11 @@ function InstagramPage() {
     doFetch();
     const id = setInterval(doFetch, config.INSTAGRAM_POLL_INTERVAL_MS);
     return () => { isMounted = false; clearInterval(id); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [username]);
 
-  // Kiosk fullscreen on first interaction
   const handleTap = useCallback(() => {
-    if (!kioskReady) {
-      requestKioskFullscreen();
-      setKioskReady(true);
-    }
+    if (!kioskReady) { requestKioskFullscreen(); setKioskReady(true); }
   }, [kioskReady]);
 
   if (loading) {
@@ -359,7 +453,10 @@ function InstagramPage() {
   );
 }
 
-// ── YouTube display page — loaded directly via /youtube/:username ─────────
+// ─────────────────────────────────────────────────────────────────────────────
+// YouTubePage — /youtube/:username
+// ─────────────────────────────────────────────────────────────────────────────
+
 function YouTubePage() {
   const { username } = useParams();
   const navigate = useNavigate();
@@ -371,21 +468,42 @@ function YouTubePage() {
   const [loading, setLoading] = useState(true);
   const [kioskReady, setKioskReady] = useState(false);
 
+  // Restore persisted YouTube growth state
   useEffect(() => {
-    if (!username || !apiKey) {
-      setLoading(false);
-      return;
+    if (!username) return;
+    const stored = loadGrowthState('yt_' + username);
+    const today  = todayDateString();
+    if (stored && stored.date === today) {
+      setTodayGrowth(stored.growth);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [username]);
+
+  const lastDateRef = useRef(todayDateString());
+
+  useEffect(() => {
+    if (!username || !apiKey) { setLoading(false); return; }
     let isMounted = true;
 
     const doFetch = async () => {
       try {
         const count = await fetchYouTubeSubscribers(username, apiKey);
         if (!isMounted) return;
-        setSubscribers(prev => {
-          if (prev != null && count > prev) setTodayGrowth(g => g + (count - prev));
-          return count;
-        });
+
+        const today = todayDateString();
+        if (today !== lastDateRef.current) {
+          lastDateRef.current = today;
+          const newState = { date: today, baseline: count, growth: 0 };
+          saveGrowthState('yt_' + username, newState);
+          setSubscribers(count);
+          setTodayGrowth(0);
+          setError('');
+          return;
+        }
+
+        const { growth } = computeGrowth(count, 'yt_' + username);
+        setSubscribers(count);
+        setTodayGrowth(growth);
         setError('');
       } catch (e) {
         if (isMounted) {
@@ -458,18 +576,17 @@ function YouTubePage() {
   );
 }
 
-// ── Root with router ──────────────────────────────────────────────────────
+// ── Root with router ──────────────────────────────────────────────────────────
 function Root() {
   return (
     <BrowserRouter>
       <Routes>
         <Route path="/instagram/:username" element={<InstagramPage />} />
-        <Route path="/youtube/:username" element={<YouTubePage />} />
-        <Route path="*" element={<App />} />
+        <Route path="/youtube/:username"   element={<YouTubePage />} />
+        <Route path="*"                    element={<App />} />
       </Routes>
     </BrowserRouter>
   );
 }
 
 export default Root;
-
