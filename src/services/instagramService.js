@@ -6,7 +6,14 @@
 
 export async function fetchInstagramFollowers(username) {
   const cleanUsername = username.replace(/^@/, '').toLowerCase().trim();
-  const res = await fetch(`/api/instagram/lookup/${encodeURIComponent(cleanUsername)}`);
+
+  // Development: CRA dev server proxy (setupProxy.js handles the request server-side)
+  // Production:  PHP proxy deployed alongside the build (public/api/instagram.php)
+  const url = process.env.NODE_ENV === 'production'
+    ? `/api/instagram.php?username=${encodeURIComponent(cleanUsername)}`
+    : `/api/instagram/lookup/${encodeURIComponent(cleanUsername)}`;
+
+  const res = await fetch(url);
 
   if (res.status === 429) {
     throw new Error('Rate limit exceeded. Please wait a moment and try again.');

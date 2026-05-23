@@ -1,0 +1,5 @@
+# Block direct browser access to cache and session files
+<FilesMatch "\.(json|cookies|age|txt)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
